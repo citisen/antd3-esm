@@ -1,0 +1,117 @@
+name: Publish to npm
+
+# 发布只有一条路径：推一个与 package.json 版本严格一致的 tag（vX.Y.Z / vX.Y.Z-pre）。
+# 没有 workflow_dispatch、没有分支触发、没有任何手动 publish 入口 —— 越少入口越难被误用。
+#
+# 凭证完全来自 GitHub OIDC（npm Trusted Publishing），不使用任何 npm token：
+# 工作流里没有 secrets.NPM_TOKEN，仓库里也不需要配置 secret。
+# npm 侧 Trusted Publisher 的配置必须与这里完全对应：
+#   Organization or user = citisen
+#   Repository           = antd3-esm
+#   Workflow filename    = publish.yml
+#   Environment name     = npm-publish
+#   Permissions          = npm stage publish   ← 只有送审权限，最终发布必须人工 2FA 批准
+#
+# 因为权限是 `npm stage publish`，本工作流只能把产物「送审」到 npm 的 staging 区；
+# 真正上线由维护者在本机执行 `npm stage approve <stage-id>`（要求 2FA）完成，
+# 这是 npm 目前最严格的发布路径：CI 被攻破也只能送审，不能直接发布。
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 默认零权限，权限只在下面这个 job 上按需最小化打开。
+permissions: {}
+
+# 同一时间只允许一个发布在跑；已经开始送审就绝不取消。
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    name: Stage release via npm Trusted Publishing (OIDC)
+    # 固定 runner 镜像，不用 ubuntu-latest，避免镜像漂移。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # 建议在 Settings → Environments 给 npm-publish 配置 required reviewers，
+    # 并把 deployment tag 规则限制为 v*；npm 侧 Trusted Publisher 的 Environment 填同名值。
+    # 这一层挡的是「谁能让 CI 送审」，批准发布的那一层在 npm 侧（2FA）。
+    environment: npm-publish
+    permissions:
+      contents: read # 读取 tag 对应的提交内容
+      id-token: write # 唯一“凭证”：由 GitHub OIDC 换取 npm 的短期送审授权
+    env:
+      # 供应链防线：CI 内任何安装/打包动作都不执行依赖包的生命周期脚本
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+      NPM_CONFIG_AUDIT: 'false'
+      NPM_CONFIG_FUND: 'false'
+      RELEASE_EVIDENCE: ${{ runner.temp }}/release-evidence.json
+      STAGE_OUTPUT: ${{ runner.temp }}/stage-output.json
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0 # 需要完整历史，用来确认 tag 落在默认分支上
+          persist-credentials: false # 不把 GitHub token 留在 .git/config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          # Node 24 满足 trusted publishing / provenance 对 Node 的要求。
+          node-version: '24'
+          # 故意不设置 registry-url：避免 actions/setup-node 生成带 ${NODE_AUTH_TOKEN}
+          # 的 .npmrc —— 本工作流不使用任何 token。
+
+      - name: Install the pinned npm CLI (staged publishing)
+        env:
+          # 钉住 npm 版本：npm stage / trusted publishing / provenance 的行为都可复现。
+          # 升级前请在本地跑 `npm stage publish --help` 与 release gate 验证。
+          NPM_VERSION: 11.19.1
+        run: |
+          set -euo pipefail
+          npm install --global "npm@${NPM_VERSION}" --ignore-scripts --no-audit --no-fund
+          installed="$(npm --version)"
+          if [ "$installed" != "$NPM_VERSION" ]; then
+            echo "::error::npm 版本不是钉住的 ${NPM_VERSION}（实际 ${installed}）"
+            exit 1
+          fi
+          # 能力断言比版本号更直接：这个 npm 必须真的支持 send-for-review
+          npm stage publish --help >/dev/null
+          node --version
+          echo "npm ${installed} OK（支持 npm stage publish）"
+
+      - name: Assert the tag commit is on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # checkout 已经取了完整历史；这里再刷新一次默认分支，失败也能沿用已有 refs。
+          git fetch --no-tags origin "$DEFAULT_BRANCH" 2>/dev/null || echo "::warning::刷新 origin/$DEFAULT_BRANCH 失败，使用 checkout 已有的 refs"
+          git rev-parse --verify "origin/$DEFAULT_BRANCH" >/dev/null
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::tag 指向的提交 $GITHUB_SHA 不在 $DEFAULT_BRANCH 上，拒绝发布"
+            exit 1
+          fi
+          echo "OK: $GITHUB_SHA 位于 $DEFAULT_BRANCH 上"
+
+      - name: Release gate (verify invariants, pack, fingerprint)
+        # 不安装任何依赖：发布的是仓库里已提交、可 review 的 dist/ 产物。
+        # 该步骤把 tarball 的 SRI/shasum 写入 evidence 文件，供送审后与线上逐字节比对。
+        run: node .github/scripts/verify-release.mjs
+
+      - name: Stage the release on npm (OIDC; the token cannot publish)
+        run: |
+          set -euo pipefail
+          npm stage publish \
+            --registry=https://registry.npmjs.org/ \
+            --access=public \
+            --provenance \
+            --json > "$STAGE_OUTPUT"
+          echo "npm stage publish 原始输出："
+          cat "$STAGE_OUTPUT"
+
+      - name: Cross-check the staged release and record the stage id
+        # 交叉校验：npm 上报的 integrity/shasum/体积必须与门禁阶段本地打包的完全一致，
+        # 并把 stage id 与批准命令写进 job summary。
+        run: node .github/scripts/record-stage.mjs

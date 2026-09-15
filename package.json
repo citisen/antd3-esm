@@ -2,19 +2,24 @@
     "name": "antd3-esm",
     "version": "2.0.0",
     "description": "",
-    "homepage": "https://github.com/j-sen/antd3-esm#readme",
+    "homepage": "https://github.com/citisen/antd3-esm#readme",
     "bugs": {
-        "url": "https://github.com/j-sen/antd3-esm/issues"
+        "url": "https://github.com/citisen/antd3-esm/issues"
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/j-sen/antd3-esm.git"
+        "url": "git+https://github.com/citisen/antd3-esm.git"
     },
     "license": "MIT",
-    "author": "j-sen",
+    "author": "citisen",
     "type": "module",
     "scripts": {
         "build": "node build.ts"
+    },
+    "publishConfig": {
+        "registry": "https://registry.npmjs.org/",
+        "access": "public",
+        "provenance": true
     },
     "peerDependencies": {
         "antd": "^3.26.20"
