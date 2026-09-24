@@ -22,10 +22,10 @@
         "provenance": true
     },
     "peerDependencies": {
-        "antd": "^3.26.20"
+        "antd": "^6.6.5"
     },
     "dependencies": {
-        "antd": "^3.26.20"
+        "antd": "^6.6.5"
     },
     "files": [
         "dist/*"
